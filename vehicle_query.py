@@ -258,6 +258,9 @@ Examples:
 
   # List available field names
   python vehicle_query.py --fields
+
+  # Show ALL fields for search results
+  python vehicle_query.py --search TOYOTA --all-fields
         """,
     )
     p.add_argument("--search", "-s", metavar="TEXT",
@@ -275,6 +278,8 @@ Examples:
                    help="Start offset for pagination (default: 0)")
     p.add_argument("--all-pages", action="store_true",
                    help="Fetch ALL pages (overrides --limit for total fetch)")
+    p.add_argument("--all-fields", "-A", action="store_true",
+                   help="Display all available fields in results (overrides --fields)")
     p.add_argument("--count", "-c", action="store_true",
                    help="Print only the total count, no records")
     p.add_argument("--export", "-e", metavar="FILE.csv",
@@ -328,7 +333,9 @@ def main() -> None:
     print(f"\nTotal matching: {total:,}  |  Showing: {shown}\n")
 
     # Determine display fields
-    if args.fields and args.fields != "__list__":
+    if args.all_fields:
+        display_fields = list(FIELDS.keys())
+    elif args.fields and args.fields != "__list__":
         display_fields = [f.strip() for f in args.fields.split(",")]
         unknown = [f for f in display_fields if f not in FIELDS and f != "_id"]
         if unknown:
