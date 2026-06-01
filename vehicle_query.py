@@ -15,6 +15,7 @@ Usage examples:
 """
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import sys
@@ -29,6 +30,41 @@ from typing import Any, Dict, List, Optional, Tuple
 API_BASE = "https://data.gov.il/api/action/datastore_search"
 RESOURCE_ID = "053cea08-09bc-40ec-8f7a-156f0677aff3"
 DEFAULT_LIMIT = 20
+
+# ---------------------------------------------------------------------------
+# Enrichment constants
+# ---------------------------------------------------------------------------
+
+NHTSA_VPIC_URL     = "https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVin/{vin}?format=json"
+HISTORY_RESOURCE   = "56063a99-8a3e-4ff4-912e-5966c0279bad"
+RECALLS_RESOURCE   = "2c33523f-87aa-44ec-a736-edbb0a82975e"
+OPEN_RECALL_RESOURCE = "36bf1404-0be4-49d2-82dc-2f1ead4a8b93"
+
+# NHTSA vPIC field names → human-readable labels (subset of the 140 returned)
+NHTSA_FIELDS: Dict[str, str] = {
+    "Make":                               "Make",
+    "Model":                              "Model",
+    "Model Year":                         "Model Year",
+    "Body Class":                         "Body Class",
+    "Doors":                              "Doors",
+    "Drive Type":                         "Drive Type",
+    "Fuel Type - Primary":                "Fuel Type",
+    "Electrification Level":              "Electrification Level",
+    "Engine Number of Cylinders":         "Cylinders",
+    "Displacement (CC)":                  "Displacement (CC)",
+    "Engine Power (kW)":                  "Power (kW)",
+    "Transmission Style":                 "Transmission",
+    "ABS":                                "ABS",
+    "Electronic Stability Control (ESC)": "ESC",
+    "Backup Camera":                      "Backup Camera",
+    "Front Air Bag Locations":            "Front Airbags",
+    "Side Air Bag Locations":             "Side Airbags",
+    "Battery Energy (kWh) From":          "Battery (kWh)",
+    "Trim":                               "Trim",
+    "Series":                             "Series",
+    "Plant Country":                      "Plant Country",
+    "Plant City":                         "Plant City",
+}
 
 FIELDS = {
     "mispar_rechev":       "Vehicle number",
@@ -93,6 +129,23 @@ def build_url(
     return API_BASE + "?" + urllib.parse.urlencode(params)
 
 
+def build_resource_url(
+    resource_id: str,
+    filters: Optional[Dict[str, Any]] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> str:
+    """Generic URL builder for any data.gov.il resource (used by enrichment)."""
+    params: dict[str, Any] = {
+        "resource_id": resource_id,
+        "limit": limit,
+        "offset": offset,
+    }
+    if filters:
+        params["filters"] = json.dumps(filters)
+    return API_BASE + "?" + urllib.parse.urlencode(params)
+
+
 def fetch(url: str) -> Dict:
     req = urllib.request.Request(url, headers={"User-Agent": "vehicle-query/1.0"})
     try:
@@ -105,6 +158,14 @@ def fetch(url: str) -> Dict:
     except urllib.error.URLError as e:
         print(f"[ERROR] Network error: {e.reason}", file=sys.stderr)
         sys.exit(1)
+
+
+def fetch_safe(url: str) -> Optional[Dict]:
+    """Like fetch() but returns None on error — used for optional enrichment calls."""
+    try:
+        return fetch(url)
+    except SystemExit:
+        return None
 
 
 def query(
@@ -265,6 +326,209 @@ def print_fields() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Enrichment functions
+# ---------------------------------------------------------------------------
+
+def enrich_nhtsa(vin: str) -> Dict[str, Any]:
+    """Decode VIN via the free NHTSA vPIC API (~140 fields, no key required)."""
+    vin = (vin or "").strip()
+    if not vin:
+        return {"_error": "No VIN available"}
+    url = NHTSA_VPIC_URL.format(vin=urllib.parse.quote(vin))
+    data = fetch_safe(url)
+    if data is None:
+        return {"_error": "NHTSA API unreachable"}
+
+    result: Dict[str, Any] = {}
+    warning_parts: List[str] = []
+    for item in data.get("Results", []):
+        var = item.get("Variable", "")
+        val = (item.get("Value") or "").strip()
+        if not val or val in ("Not Applicable", "null", "None"):
+            continue
+        if var in NHTSA_FIELDS:
+            result[NHTSA_FIELDS[var]] = val
+        elif var == "Error Code" and val != "0":
+            err_text = next(
+                ((i.get("Value") or "") for i in data["Results"]
+                 if i.get("Variable") == "Additional Error Text"),
+                "",
+            )
+            warning_parts.append(f"Error {val}: {err_text}".strip(": "))
+    if warning_parts:
+        result["_warning"] = "; ".join(warning_parts)
+    return result
+
+
+def enrich_history(plate: Any) -> Dict[str, Any]:
+    """Fetch vehicle history from data.gov.il (odometer, damage/mod flags, etc.)."""
+    try:
+        plate_val: Any = int(plate)
+    except (TypeError, ValueError):
+        plate_val = plate
+    url = build_resource_url(HISTORY_RESOURCE, filters={"mispar_rechev": plate_val}, limit=1)
+    data = fetch_safe(url)
+    if data is None:
+        return {"_error": "History API unreachable"}
+    records = data.get("result", {}).get("records", [])
+    if not records:
+        return {"_error": "No history record found"}
+    r = records[0]
+
+    def flag(val: Any) -> str:
+        return "Yes" if val and str(val).strip() not in ("0", "", "None") else "No"
+
+    return {
+        "Engine number":           r.get("mispar_manoa") or "—",
+        "First registration":      r.get("rishum_rishon_dt") or "—",
+        "Odometer at last test":   r.get("kilometer_test_aharon") or "—",
+        "Structural modification": flag(r.get("shinui_mivne_ind")),
+        "Body damage":             flag(r.get("gapam_ind")),
+        "Color change":            flag(r.get("shnui_zeva_ind")),
+        "Tire change":             flag(r.get("shinui_zmig_ind")),
+        "Originality":             r.get("mkoriut_nm") or "—",
+    }
+
+
+def enrich_recalls(tozeret_cd: Any) -> List[Dict[str, Any]]:
+    """Fetch Israeli-market recalls for a manufacturer code."""
+    if not tozeret_cd:
+        return []
+    try:
+        cd_val: Any = int(tozeret_cd)
+    except (TypeError, ValueError):
+        cd_val = tozeret_cd
+    url = build_resource_url(RECALLS_RESOURCE, filters={"TOZAR_CD": cd_val}, limit=100)
+    data = fetch_safe(url)
+    if data is None:
+        return []
+    out = []
+    for r in data.get("result", {}).get("records", []):
+        out.append({
+            "Recall ID":   r.get("RECALL_ID") or "—",
+            "Model":       r.get("DEGEM") or "—",
+            "Year":        r.get("SHNAT_RECALL") or "—",
+            "Type":        r.get("SUG_RECALL") or "—",
+            "Component":   r.get("SUG_TAKALA") or "—",
+            "Description": r.get("TEUR_TAKALA") or "—",
+            "Fix":         r.get("OFEN_TIKUN") or "—",
+            "Importer":    r.get("YEVUAN_TEUR") or "—",
+        })
+    return out
+
+
+def enrich_open_recall(plate: Any) -> List[Dict[str, Any]]:
+    """Check if this vehicle has any pending unperformed recalls."""
+    try:
+        plate_val: Any = int(plate)
+    except (TypeError, ValueError):
+        plate_val = plate
+    url = build_resource_url(OPEN_RECALL_RESOURCE, filters={"mispar_rechev": plate_val}, limit=10)
+    data = fetch_safe(url)
+    if data is None:
+        return []
+    return data.get("result", {}).get("records", [])
+
+
+def run_enrichment(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Run all four enrichment sources concurrently for a single vehicle record."""
+    plate      = rec.get("mispar_rechev", "")
+    vin        = rec.get("misgeret", "")
+    tozeret_cd = rec.get("tozeret_cd")
+
+    tasks = {
+        "nhtsa":   (enrich_nhtsa,       vin),
+        "history": (enrich_history,     plate),
+        "recalls": (enrich_recalls,     tozeret_cd),
+        "open":    (enrich_open_recall, plate),
+    }
+    results: Dict[str, Any] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        future_to_key = {ex.submit(fn, arg): key for key, (fn, arg) in tasks.items()}
+        for future in concurrent.futures.as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as exc:
+                results[key] = {"_error": str(exc)}
+    return results
+
+
+def print_enrichment_card(rec: Dict[str, Any], enrichment: Dict[str, Any]) -> None:
+    """Print a human-readable enrichment detail card for one vehicle."""
+    plate = rec.get("mispar_rechev", "?")
+    model = rec.get("kinuy_mishari", "")
+    mfr   = rec.get("tozeret_nm", "")
+    year  = rec.get("shnat_yitzur", "")
+
+    bar = "=" * 64
+    print(f"\n{bar}")
+    print(f"  {plate}  —  {model}  ({mfr}, {year})")
+    print(bar)
+
+    # --- NHTSA specs ---
+    print("\n[ NHTSA Specs ]")
+    nhtsa = dict(enrichment.get("nhtsa") or {})
+    if not nhtsa:
+        print("  (no data)")
+    elif "_error" in nhtsa:
+        print(f"  {nhtsa['_error']}")
+    else:
+        warning = nhtsa.pop("_warning", None)
+        for label, val in nhtsa.items():
+            print(f"  {label:<30} {val}")
+        if warning:
+            print(f"  [!] {warning}")
+
+    # --- Vehicle history ---
+    print("\n[ Israeli Vehicle History ]")
+    history = enrichment.get("history") or {}
+    if not history:
+        print("  (no data)")
+    elif "_error" in history:
+        print(f"  {history['_error']}")
+    else:
+        for label, val in history.items():
+            s = str(val)
+            display_val = rtl_display(s) if _has_hebrew(s) else s
+            print(f"  {label:<30} {display_val}")
+
+    # --- Israeli recalls ---
+    print("\n[ Israeli Recalls ]")
+    recalls = enrichment.get("recalls") or []
+    if not recalls:
+        print("  No recalls on record for this manufacturer.")
+    else:
+        for r in recalls:
+            rid     = r.get("Recall ID", "—")
+            mdl     = r.get("Model", "—")
+            mdl_d   = rtl_display(mdl) if _has_hebrew(mdl) else mdl
+            yr      = r.get("Year", "—")
+            comp    = r.get("Component", "—")
+            comp_d  = rtl_display(comp) if _has_hebrew(comp) else comp
+            desc    = r.get("Description", "—")
+            desc_d  = rtl_display(desc) if _has_hebrew(desc) else desc
+            fix     = r.get("Fix", "—")
+            fix_d   = rtl_display(fix) if _has_hebrew(fix) else fix
+            print(f"  [{rid}] {mdl_d} ({yr})")
+            print(f"    Component  : {comp_d}")
+            print(f"    Description: {desc_d}")
+            print(f"    Fix        : {fix_d}")
+
+    # --- Open / unperformed recalls ---
+    print("\n[ Open Recall Status ]")
+    open_r = enrichment.get("open") or []
+    if not open_r:
+        print("  No pending unperformed recalls.")
+    else:
+        print(f"  *** {len(open_r)} UNPERFORMED RECALL(S) for plate {plate} ***")
+        for r in open_r:
+            print(f"  {r}")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -322,6 +586,12 @@ Examples:
 
   # Show ALL fields for search results
   python vehicle_query.py --search TOYOTA --all-fields
+
+  # Full enrichment for a single vehicle by plate number
+  python vehicle_query.py --filter mispar_rechev=12345678 --enrich
+
+  # Same but as JSON
+  python vehicle_query.py --filter mispar_rechev=12345678 --enrich --json
         """,
     )
     p.add_argument("--search", "-s", metavar="TEXT",
@@ -347,6 +617,10 @@ Examples:
                    help="Export results to a CSV file")
     p.add_argument("--json", action="store_true",
                    help="Print raw JSON output instead of a table")
+    p.add_argument("--enrich", action="store_true",
+                   help="Fetch extra data (NHTSA specs, vehicle history, Israeli recalls, "
+                        "open recall status). Requires the query to return exactly one "
+                        "vehicle — use --filter mispar_rechev=PLATE to target a single plate.")
     return p
 
 
@@ -404,11 +678,30 @@ def main() -> None:
     else:
         display_fields = DEFAULT_DISPLAY_FIELDS
 
+    # --enrich: validate we have exactly one vehicle
+    enrichment: Optional[Dict[str, Any]] = None
+    if args.enrich:
+        if len(records) != 1:
+            print(
+                f"\n[ERROR] --enrich requires exactly one vehicle in results "
+                f"(got {len(records)}).\n"
+                f"       Use --filter mispar_rechev=PLATE to query a specific plate number.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("Fetching enrichment data...", file=sys.stderr)
+        enrichment = run_enrichment(records[0])
+
     # Output
     if args.json:
-        print(json.dumps(records, ensure_ascii=False, indent=2))
+        out = apply_rtl(records)
+        if enrichment is not None:
+            out[0]["_enrichment"] = apply_rtl(enrichment)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
         print_table(records, display_fields)
+        if enrichment is not None:
+            print_enrichment_card(records[0], enrichment)
 
     if not args.all_pages and shown < total:
         next_offset = args.offset + shown
