@@ -155,6 +155,66 @@ def query(
 
 
 # ---------------------------------------------------------------------------
+# RTL / BiDi helpers
+# ---------------------------------------------------------------------------
+
+def _has_hebrew(text: str) -> bool:
+    """Return True if *text* contains any Hebrew Unicode character."""
+    return any("\u0590" <= c <= "\u05FF" for c in text)
+
+
+def rtl_display(text: str) -> str:
+    """
+    Prepare *text* for correct visual rendering in a left-to-right terminal.
+
+    Strategy (in order):
+      1. Use python-bidi (``pip install python-bidi``) for full Unicode BiDi
+         algorithm support — handles mixed LTR/RTL content correctly.
+      2. Fall back to reversing the string, which is accurate for strings
+         that are purely Hebrew (no embedded Latin runs).  This covers all
+         common values in the Israeli vehicle registry (colors, ownership
+         types, fuel types, etc.).
+    """
+    if not _has_hebrew(text):
+        return text
+    try:
+        from bidi.algorithm import get_display  # type: ignore
+        return get_display(text)
+    except ImportError:
+        pass
+    # Fallback: reverse the whole string.  Correct for pure-Hebrew values;
+    # mixed content (e.g. "BMW פרטי") will look odd without python-bidi.
+    return text[::-1]
+
+
+def apply_rtl(obj: Any) -> Any:
+    """Recursively apply :func:`rtl_display` to every string in *obj*."""
+    if isinstance(obj, str):
+        return rtl_display(obj)
+    if isinstance(obj, dict):
+        return {k: apply_rtl(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [apply_rtl(item) for item in obj]
+    return obj
+
+
+def format_cell(value: Any, width: int) -> str:
+    """
+    Render a table cell of exactly *width* characters.
+
+    Hebrew values are passed through :func:`rtl_display` and then
+    **right-aligned** so the text starts at the natural right edge of the
+    cell.  Latin / numeric values are left-aligned as usual.
+    """
+    val = str(value or "")
+    if len(val) > width:
+        val = val[:width]
+    if _has_hebrew(val):
+        return rtl_display(val).rjust(width)
+    return val.ljust(width)
+
+
+# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
@@ -176,14 +236,15 @@ def print_table(records: List[Dict], display_fields: List[str]) -> None:
     widths = [col_width(h, records, f) for h, f in zip(headers, display_fields)]
 
     sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
-    fmt = "| " + " | ".join(f"{{:<{w}}}" for w in widths) + " |"
+    # Headers are always Latin field names — left-aligned
+    header_fmt = "| " + " | ".join(f"{{:<{w}}}" for w in widths) + " |"
 
     print(sep)
-    print(fmt.format(*[h[:w] for h, w in zip(headers, widths)]))
+    print(header_fmt.format(*[h[:w] for h, w in zip(headers, widths)]))
     print(sep)
     for rec in records:
-        row = [str(rec.get(f, "") or "")[:w] for f, w in zip(display_fields, widths)]
-        print(fmt.format(*row))
+        cells = [format_cell(rec.get(f, ""), w) for f, w in zip(display_fields, widths)]
+        print("| " + " | ".join(cells) + " |")
     print(sep)
 
 
